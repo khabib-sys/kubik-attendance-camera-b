@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<!-- This page cannot load or send anything over the network: connect-src 'none'.
+     Its only output channel is window.opener.postMessage to an allow-listed origin. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; media-src blob: mediastream:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Kubik — Kamera (Experiment B)</title>
+<style>
+  :root { --ink: #1f2937; --muted: #6b7280; --line: #e5e7eb; --accent: #1a56db; --ok: #137333; --bad: #b3261e; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--ink); background: #f7f8fa; }
+  main { max-width: 560px; margin: 0 auto; padding: 14px; }
+  h1 { font-size: 17px; margin: 4px 0 8px; }
+  .card { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 12px; margin-bottom: 10px; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .stage { position: relative; width: 100%; aspect-ratio: 3 / 4; background: #111; border-radius: 10px; overflow: hidden; }
+  video, img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  video { transform: scaleX(-1); }
+  .row { display: flex; gap: 8px; margin-top: 10px; }
+  button { flex: 1; font: inherit; font-weight: 600; padding: 12px; border-radius: 10px; border: 1px solid var(--line); background: #fff; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button:disabled { opacity: .45; }
+  .status { font-weight: 700; margin: 6px 0; }
+  .status.ok { color: var(--ok); } .status.bad { color: var(--bad); }
+  pre { font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace; background: #f3f4f6; padding: 8px; border-radius: 8px; white-space: pre-wrap; word-break: break-word; margin: 8px 0 0; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Kamera — Experiment B</h1>
+  <div class="card">
+    <div class="status" id="status">Menyiapkan…</div>
+    <div class="muted" id="sub"></div>
+  </div>
+  <div class="card" id="camCard" hidden>
+    <div class="stage">
+      <video id="video" playsinline muted autoplay></video>
+      <img id="shot" alt="Foto" hidden>
+    </div>
+    <div class="row" id="liveRow">
+      <button id="capture" class="primary" disabled>Capture</button>
+    </div>
+    <div class="row" id="reviewRow" hidden>
+      <button id="retake">Retake</button>
+      <button id="use" class="primary">Use Photo</button>
+    </div>
+    <div class="row" id="retryRow" hidden>
+      <button id="startCam" class="primary">Mulai kamera</button>
+    </div>
+  </div>
+  <div class="card">
+    <div class="muted">Diagnostik</div>
+    <pre id="diag"></pre>
+  </div>
+</main>
+
+<script>
+(function () {
+  'use strict';
+
+  // ---------------------------------------------------------------- CONFIG (edit before hosting)
+  // Exact origin(s) of the Apps Script page that may open this camera page.
+  // Shown as "this_page_origin" on the Apps Script spike page (?page=spike-camera-b).
+  // Example: 'https://n-abc123def456-0lu-script.googleusercontent.com'
+  var CONFIG = {
+    ALLOWED_PARENT_ORIGINS: ['https://n-arosf73t3qcd3pwhk6u4fbinx4uuosl6jf3luty-0lu-script.googleusercontent.com']
+  };
+  // ----------------------------------------------------------------
+
+  var session = null;     // { sid, token, nonce, exp, parentOrigin } — received once via postMessage
+  var stream = null, captured = null, sent = false, helloTries = 0, helloTimer = null;
+  var T0 = Date.now(), previewStarted = false, retakes = 0;
+  var D = {
+    top_level: (function () { try { return window.top === window.self; } catch (e) { return false; } })(),
+    secure_context: !!window.isSecureContext,
+    opener_present: !!window.opener,
+    media_devices: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia),
+    file_input_present: false,
+    origin: location.origin
+  };
+  (function () { var pp = document.permissionsPolicy || document.featurePolicy; if (pp && pp.allowsFeature) { try { D.policy_camera = pp.allowsFeature('camera'); } catch (e) { /* ignore */ } } })();
+
+  function $(id) { return document.getElementById(id); }
+  function status(text, cls) { var el = $('status'); el.textContent = text; el.className = 'status ' + (cls || ''); }
+  function sub(text) { $('sub').textContent = text || ''; }
+  function diag() { D.file_input_present = !!document.querySelector('input[type=file]'); $('diag').textContent = JSON.stringify(D, null, 2); }
+  diag();
+
+  function fail(text, detail) { status(text, 'bad'); sub(detail || ''); diag(); }
+
+  // ---------------------------------------------------------------- preconditions
+  if (!D.top_level) return fail('Halaman ini harus dibuka sebagai halaman penuh, bukan di dalam frame.');
+  if (!CONFIG.ALLOWED_PARENT_ORIGINS.length) return fail('Halaman kamera belum dikonfigurasi.', 'ALLOWED_PARENT_ORIGINS kosong.');
+  if (!window.opener) return fail('Buka halaman ini dari aplikasi (tombol "Open External Camera").', 'window.opener tidak ada — tidak ada aplikasi yang bisa menerima foto.');
+
+  // ---------------------------------------------------------------- messaging (trust boundary)
+  function toParent(msg) {
+    if (!session || !window.opener || window.opener.closed) return false;
+    window.opener.postMessage(msg, session.parentOrigin); // exact origin, never '*'
+    return true;
+  }
+
+  window.addEventListener('message', function (e) {
+    var d = e.data;
+    if (!d || typeof d !== 'object' || typeof d.type !== 'string' || d.type.indexOf('CAMB_') !== 0) return;
+    if (e.isTrusted === false) return;
+    if (e.source !== window.opener) return;                                   // only our opener
+    if (CONFIG.ALLOWED_PARENT_ORIGINS.indexOf(e.origin) < 0) {                // only allow-listed origins
+      D.rejected_origin = e.origin; diag();
+      return fail('Aplikasi pembuka tidak diizinkan.', 'Origin ' + e.origin + ' tidak ada di ALLOWED_PARENT_ORIGINS.');
+    }
+    if (d.v !== 1) return;
+
+    if (d.type === 'CAMB_INIT') {
+      if (!/^[0-9a-f]{32}$/.test(d.sid || '') || !/^[0-9a-f]{32}$/.test(d.nonce || '') || !/^b1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(d.token || '')) return;
+      if (session && session.sid !== d.sid) return;                            // one session per page load
+      if (session) return;                                                     // duplicate INIT for same session
+      session = { sid: d.sid, token: d.token, nonce: d.nonce, exp: Number(d.exp) || 0, parentOrigin: e.origin };
+      clearInterval(helloTimer);
+      D.parent_origin = e.origin; D.session = d.sid.substring(0, 8) + '…'; diag();
+      status('Sesi terverifikasi dari aplikasi.', '');
+      sub('Berlaku sampai ' + (session.exp ? new Date(session.exp * 1000).toLocaleTimeString() : '?') + '. Foto hanya dikirim ke aplikasi yang membuka halaman ini.');
+      $('camCard').hidden = false;
+      startCamera();
+      return;
+    }
+    if (d.type === 'CAMB_ACK') {
+      if (!session || d.sid !== session.sid) return;
+      if (d.ok) { status('Foto diterima dan diverifikasi aplikasi. Halaman ini akan ditutup…', 'ok'); setTimeout(function () { window.close(); }, 1500); }
+      else status('Aplikasi menolak foto: ' + d.code, 'bad');
+    }
+  });
+
+  function hello() {
+    helloTries++;
+    if (helloTries > 15) { clearInterval(helloTimer); return fail('Aplikasi tidak menjawab.', 'Tidak ada INIT dari origin yang diizinkan. Cek ALLOWED_PARENT_ORIGINS.'); }
+    // HELLO carries no data; it is sent only to allow-listed origins, never '*'.
+    CONFIG.ALLOWED_PARENT_ORIGINS.forEach(function (o) {
+      try { window.opener.postMessage({ type: 'CAMB_HELLO', v: 1, top_level: D.top_level }, o); } catch (e) { /* opener gone */ }
+    });
+  }
+  status('Menghubungkan ke aplikasi…');
+  hello(); helloTimer = setInterval(hello, 1000);
+
+  // ---------------------------------------------------------------- camera
+  function stopStream() { if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; } }
+
+  function startCamera() {
+    $('retryRow').hidden = true; $('reviewRow').hidden = true; $('liveRow').hidden = false;
+    $('shot').hidden = true; $('video').hidden = false; $('capture').disabled = true;
+    if (!D.media_devices) return cameraError({ name: 'NotSupportedError', message: 'getUserMedia tidak tersedia' });
+    status('Meminta izin kamera…');
+    navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'user' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false })
+      .then(function (s) {
+        stream = s;
+        var v = $('video'); v.srcObject = s;
+        return v.play().then(function () { return waitFrames(v); });
+      })
+      .then(function () {
+        previewStarted = true;
+        var t = stream.getVideoTracks()[0], st = t && t.getSettings ? t.getSettings() : {};
+        D.track_label = t ? t.label : ''; D.facing_mode = st.facingMode || '(tidak dilaporkan)'; D.stream = (st.width || '?') + 'x' + (st.height || '?');
+        D.preview_ms = Date.now() - T0; diag();
+        status('Kamera aktif. Tekan Capture.', ''); $('capture').disabled = false;
+      })
+      .catch(cameraError);
+  }
+  function waitFrames(v) {
+    return new Promise(function (res, rej) { var n = 0; (function tick() { if (v.videoWidth > 0) return res(); if (++n > 50) return rej(new Error('Video tidak mengirim frame')); setTimeout(tick, 100); })(); });
+  }
+  function cameraError(e) {
+    stopStream();
+    var name = e && e.name || 'Error', msg = e && e.message || String(e);
+    D.camera_error = name + ': ' + msg; diag();
+    var hint = name === 'NotAllowedError' ? 'Izin kamera ditolak. Buka pengaturan situs/browser, izinkan Kamera, lalu tekan "Mulai kamera".'
+      : name === 'NotFoundError' ? 'Tidak ada kamera terdeteksi.' : name === 'NotReadableError' ? 'Kamera sedang dipakai aplikasi lain.' : '';
+    fail('Kamera gagal: ' + name, hint + ' Tidak ada alternatif upload file di halaman ini.');
+    $('retryRow').hidden = false; $('liveRow').hidden = true;
+    toParent({ type: 'CAMB_ERROR', v: 1, sid: session.sid, nonce: session.nonce, error: name + ': ' + msg, diag: { secure_context: D.secure_context, top_level: D.top_level, policy_camera: D.policy_camera === undefined ? null : D.policy_camera } });
+  }
+
+  $('capture').onclick = function () {
+    var v = $('video'), w = v.videoWidth, h = v.videoHeight;
+    if (!w || !h) return;
+    var s = Math.min(1, 640 / Math.max(w, h)), c = document.createElement('canvas');
+    c.width = Math.round(w * s); c.height = Math.round(h * s);
+    c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+    var url = c.toDataURL('image/jpeg', 0.85);
+    captured = { b64: url.split(',')[1], width: c.width, height: c.height, at: Date.now() };
+    stopStream();
+    $('shot').src = url; $('shot').hidden = false; $('video').hidden = true;
+    $('liveRow').hidden = true; $('reviewRow').hidden = false;
+    status('Periksa foto. Use Photo untuk mengirim, Retake untuk mengulang.');
+  };
+  $('retake').onclick = function () { if (sent) return; captured = null; retakes++; startCamera(); };
+  $('startCam').onclick = startCamera;
+  $('use').onclick = function () {
+    if (sent || !captured || !session) return;
+    if (session.exp && Date.now() / 1000 > session.exp) return fail('Sesi kedaluwarsa. Tutup halaman ini dan ulangi dari aplikasi.');
+    sent = true; $('use').disabled = true; $('retake').disabled = true;
+    diag();
+    var ok = toParent({
+      type: 'CAMB_RESULT', v: 1, sid: session.sid, token: session.token, nonce: session.nonce,
+      image_b64: captured.b64, width: captured.width, height: captured.height,
+      meta: { top_level: D.top_level, secure_context: D.secure_context, preview_started: previewStarted, file_input_present: D.file_input_present,
+        track_label: D.track_label || '', facing_mode: D.facing_mode || '', stream: D.stream || '', retakes: retakes,
+        capture_ms: captured.at - T0, ua: navigator.userAgent.substring(0, 200) }
+    });
+    captured = null; // exactly one image leaves this page
+    if (ok) status('Foto dikirim ke aplikasi. Menunggu verifikasi…'); else fail('Aplikasi pembuka sudah ditutup.', 'Foto tidak terkirim.');
+  };
+})();
+</script>
+</body>
+</html>
